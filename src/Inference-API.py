@@ -20,7 +20,8 @@ __date__    = "2025-11-11"
 
 
 # 1. Import libraries for inference and API
-import io, re
+from datetime import datetime
+import io, re, json
 from fastapi import FastAPI, File, UploadFile
 from PIL import Image
 import numpy as np
@@ -30,6 +31,7 @@ from pyzbar.pyzbar import decode  # for QR code decoding
 import pytesseract                 # for OCR
 import os
 import cv2
+from pathlib import Path
 
 
 # Redirect stderr to suppress C library warnings from pyzbar
@@ -48,13 +50,35 @@ class SuppressStderr:
 
 # 2. Load the trained model weights (ensure model architecture matches training)
 device = torch.device("cpu")
+CLASS_NAMES_PATH = Path("class_names.json")
+try:
+    with CLASS_NAMES_PATH.open("r", encoding="utf-8") as class_file:
+        CLASS_NAMES = json.load(class_file)
+except FileNotFoundError:
+    CLASS_NAMES = []
+    
+
 model = models.mobilenet_v2(weights=None)  # no pre-trained weights, we will load our own
-# Prepare model structure: modify final layer to 4 classes, same as in training
+# Prepare model structure: modify final layer to match number of classes from training
 num_ftrs = model.classifier[1].in_features
-model.classifier[1] = torch.nn.Linear(num_ftrs, 4)
+num_model_classes = len(CLASS_NAMES) if CLASS_NAMES else 4
+model.classifier[1] = torch.nn.Linear(num_ftrs, num_model_classes)
 model.load_state_dict(torch.load("controller_model_weights.pth", map_location=device))
 model.eval()  # set to evaluation mode (disable dropout, etc.)
 model.to(device)
+
+
+num_model_classes = model.classifier[1].out_features
+if not CLASS_NAMES or len(CLASS_NAMES) != num_model_classes:
+    CLASS_NAMES = [f"type{i}" for i in range(num_model_classes)]
+
+LABEL_DETAILS = {
+    "type0": {"type": "Unknown", "brand": "Unknown"},
+    "type1": {"type": "Telecontroller", "brand": "Ziut"},
+    "type2": {"type": "RMC-PUK", "brand": "Remoticom"},
+    "type3": {"type": "UL2030-UL2033", "brand": "Nordic Automation Systems"},
+    "type4": {"type": "UL2034", "brand": "Nordic Automation Systems"}
+}
 
 # Define the same normalization transform as used in training for inference
 infer_transform = transforms.Compose([
@@ -90,6 +114,14 @@ def extract_eui_from_qr_original(image: Image.Image) -> str:
     
 def extract_eui_from_qr(image: Image.Image):
     try:
+        # resize image if too large
+        max_dimension = 5000
+        if max(image.size) > max_dimension:
+            print(f"Large image -> Resizing image from {image.size}... to fit within {max_dimension} px")
+            ratio = max_dimension / max(image.size)
+            new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
+            image = image.resize(new_size, Image.LANCZOS)
+
         # Convert PIL Image to OpenCV format for QR/Barcode detection
         image_np = np.array(image)
         # Convert RGB to BGR for OpenCV
@@ -129,103 +161,103 @@ def extract_eui_from_qr(image: Image.Image):
             print(f"[QR/Barcode] Detected (Otsu): '{detected_text}'")
             return detected_text, "no further action needed"
         
-        # Strategy 4: Otsu's threshold INVERTED
-        print("[QR] Otsu failed, trying inverted Otsu...")
-        otsu_inv = cv2.bitwise_not(otsu)
-        with SuppressStderr():
-            decoded_objects = decode(otsu_inv)
-        if decoded_objects:
-            detected_text = decoded_objects[0].data.decode('utf-8')
-            print(f"[QR/Barcode] Detected (Otsu inverted): '{detected_text}'")
-            return detected_text, "no further action needed"
+        # # Strategy 4: Otsu's threshold INVERTED
+        # print("[QR] Otsu failed, trying inverted Otsu...")
+        # otsu_inv = cv2.bitwise_not(otsu)
+        # with SuppressStderr():
+        #     decoded_objects = decode(otsu_inv)
+        # if decoded_objects:
+        #     detected_text = decoded_objects[0].data.decode('utf-8')
+        #     print(f"[QR/Barcode] Detected (Otsu inverted): '{detected_text}'")
+        #     return detected_text, "no further action needed"
         
-        # Strategy 5: Morphological operations to clean up noise
-        print("[QR] Otsu inverted failed, trying morphological cleanup...")
-        kernel = np.ones((3,3), np.uint8)
-        morph = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernel)
-        with SuppressStderr():
-            decoded_objects = decode(morph)
-        if decoded_objects:
-            detected_text = decoded_objects[0].data.decode('utf-8')
-            print(f"[QR/Barcode] Detected (morphological): '{detected_text}'")
-            return detected_text, "no further action needed"
+        # # Strategy 5: Morphological operations to clean up noise
+        # print("[QR] Otsu inverted failed, trying morphological cleanup...")
+        # kernel = np.ones((3,3), np.uint8)
+        # morph = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernel)
+        # with SuppressStderr():
+        #     decoded_objects = decode(morph)
+        # if decoded_objects:
+        #     detected_text = decoded_objects[0].data.decode('utf-8')
+        #     print(f"[QR/Barcode] Detected (morphological): '{detected_text}'")
+        #     return detected_text, "no further action needed"
         
-        # Strategy 6: Enhance contrast with CLAHE then invert
-        print("[QR] Morphological failed, trying CLAHE + invert...")
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-        enhanced_inv = cv2.bitwise_not(enhanced)
-        with SuppressStderr():
-            decoded_objects = decode(enhanced_inv)
-        if decoded_objects:
-            detected_text = decoded_objects[0].data.decode('utf-8')
-            print(f"[QR/Barcode] Detected (CLAHE inverted): '{detected_text}'")
-            return detected_text, "no further action needed"
+        # # Strategy 6: Enhance contrast with CLAHE then invert
+        # print("[QR] Morphological failed, trying CLAHE + invert...")
+        # clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        # enhanced = clahe.apply(gray)
+        # enhanced_inv = cv2.bitwise_not(enhanced)
+        # with SuppressStderr():
+        #     decoded_objects = decode(enhanced_inv)
+        # if decoded_objects:
+        #     detected_text = decoded_objects[0].data.decode('utf-8')
+        #     print(f"[QR/Barcode] Detected (CLAHE inverted): '{detected_text}'")
+        #     return detected_text, "no further action needed"
         
-        # Strategy 7: Sharpen + threshold
-        print("[QR] CLAHE failed, trying sharpen + threshold...")
-        kernel_sharpen = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        sharpened = cv2.filter2D(gray, -1, kernel_sharpen)
-        _, sharp_thresh = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        with SuppressStderr():
-            decoded_objects = decode(sharp_thresh)
-        if decoded_objects:
-            detected_text = decoded_objects[0].data.decode('utf-8')
-            print(f"[QR/Barcode] Detected (sharpened): '{detected_text}'")
-            return detected_text, "no further action needed"
+        # # Strategy 7: Sharpen + threshold
+        # print("[QR] CLAHE failed, trying sharpen + threshold...")
+        # kernel_sharpen = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        # sharpened = cv2.filter2D(gray, -1, kernel_sharpen)
+        # _, sharp_thresh = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # with SuppressStderr():
+        #     decoded_objects = decode(sharp_thresh)
+        # if decoded_objects:
+        #     detected_text = decoded_objects[0].data.decode('utf-8')
+        #     print(f"[QR/Barcode] Detected (sharpened): '{detected_text}'")
+        #     return detected_text, "no further action needed"
         
-        # Strategy 8: Sharpen + threshold INVERTED
-        sharp_thresh_inv = cv2.bitwise_not(sharp_thresh)
-        with SuppressStderr():
-            decoded_objects = decode(sharp_thresh_inv)
-        if decoded_objects:
-            detected_text = decoded_objects[0].data.decode('utf-8')
-            print(f"[QR/Barcode] Detected (sharpened inverted): '{detected_text}'")
-            return detected_text, "no further action needed"
+        # # Strategy 8: Sharpen + threshold INVERTED
+        # sharp_thresh_inv = cv2.bitwise_not(sharp_thresh)
+        # with SuppressStderr():
+        #     decoded_objects = decode(sharp_thresh_inv)
+        # if decoded_objects:
+        #     detected_text = decoded_objects[0].data.decode('utf-8')
+        #     print(f"[QR/Barcode] Detected (sharpened inverted): '{detected_text}'")
+        #     return detected_text, "no further action needed"
         
-        # Strategy 9: Adaptive thresholding (both regular and inverted)
-        print("[QR] Sharpened failed, trying adaptive threshold...")
-        for block_size in [11, 15, 21, 31]:
-            adaptive_thresh = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block_size, 2
-            )
-            with SuppressStderr():
-                decoded_objects = decode(adaptive_thresh)
-            if decoded_objects:
-                detected_text = decoded_objects[0].data.decode('utf-8')
-                print(f"[QR/Barcode] Detected (adaptive {block_size}): '{detected_text}'")
-                return detected_text, "no further action needed"
+        # # Strategy 9: Adaptive thresholding (both regular and inverted)
+        # print("[QR] Sharpened failed, trying adaptive threshold...")
+        # for block_size in [11, 15, 21, 31]:
+        #     adaptive_thresh = cv2.adaptiveThreshold(
+        #         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block_size, 2
+        #     )
+        #     with SuppressStderr():
+        #         decoded_objects = decode(adaptive_thresh)
+        #     if decoded_objects:
+        #         detected_text = decoded_objects[0].data.decode('utf-8')
+        #         print(f"[QR/Barcode] Detected (adaptive {block_size}): '{detected_text}'")
+        #         return detected_text, "no further action needed"
 
             
-            # Try inverted too
-            adaptive_inv = cv2.bitwise_not(adaptive_thresh)
-            with SuppressStderr():
-                decoded_objects = decode(adaptive_inv)
-            if decoded_objects:
-                detected_text = decoded_objects[0].data.decode('utf-8')
-                print(f"[QR/Barcode] Detected (adaptive {block_size} inverted): '{detected_text}'")
-                return detected_text, "no further action needed"
+        #     # Try inverted too
+        #     adaptive_inv = cv2.bitwise_not(adaptive_thresh)
+        #     with SuppressStderr():
+        #         decoded_objects = decode(adaptive_inv)
+        #     if decoded_objects:
+        #         detected_text = decoded_objects[0].data.decode('utf-8')
+        #         print(f"[QR/Barcode] Detected (adaptive {block_size} inverted): '{detected_text}'")
+        #         return detected_text, "no further action needed"
 
     
         
-        # Strategy 10: Bilateral filter (preserves edges while reducing noise)
-        print("[QR] Scaling failed, trying bilateral filter...")
-        bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
-        _, bilateral_thresh = cv2.threshold(bilateral, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        with SuppressStderr():
-            decoded_objects = decode(bilateral_thresh)
-        if decoded_objects:
-            detected_text = decoded_objects[0].data.decode('utf-8')
-            print(f"[QR/Barcode] Detected (bilateral): '{detected_text}'")
-            return detected_text, "no further action needed"
+        # # Strategy 10: Bilateral filter (preserves edges while reducing noise)
+        # print("[QR] Scaling failed, trying bilateral filter...")
+        # bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
+        # _, bilateral_thresh = cv2.threshold(bilateral, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # with SuppressStderr():
+        #     decoded_objects = decode(bilateral_thresh)
+        # if decoded_objects:
+        #     detected_text = decoded_objects[0].data.decode('utf-8')
+        #     print(f"[QR/Barcode] Detected (bilateral): '{detected_text}'")
+        #     return detected_text, "no further action needed"
         
-        bilateral_inv = cv2.bitwise_not(bilateral_thresh)
-        with SuppressStderr():
-            decoded_objects = decode(bilateral_inv)
-        if decoded_objects:
-            detected_text = decoded_objects[0].data.decode('utf-8')
-            print(f"[QR/Barcode] Detected (bilateral inverted): '{detected_text}'")
-            return detected_text, "no further action needed"
+        # bilateral_inv = cv2.bitwise_not(bilateral_thresh)
+        # with SuppressStderr():
+        #     decoded_objects = decode(bilateral_inv)
+        # if decoded_objects:
+        #     detected_text = decoded_objects[0].data.decode('utf-8')
+        #     print(f"[QR/Barcode] Detected (bilateral inverted): '{detected_text}'")
+        #     return detected_text, "no further action needed"
         
         # No QR code found after all strategies
         return "Not found", "action: try better lighting, different distance, or another camera angle."
@@ -244,40 +276,48 @@ def classify_and_extract(image: Image.Image):
     # Run model inference
     with torch.no_grad():  # no grad for efficiency
         outputs = model(img_tensor)
+        probabilities = torch.softmax(outputs, dim=1)
         # Get predicted class index
-        pred_idx = int(torch.argmax(outputs, dim=1).item())
-    
-    # Extract EUI using appropriate method
-    if pred_idx == 0:
-        eui, action = extract_eui_from_text(image)
-        action = "action: verify OCR accuracy or improve image quality"
-        if len(eui) == 8:
-            if eui.startswith("1441"):
-                action = "No action needed"
-            else:
-                eui = ""
-        else:
-            eui = ""
-        
-    else:
-        eui, action = extract_eui_from_qr(image)
-        if eui.lower().startswith("70b3d5b02013") or eui.lower().startswith("70b3d5b02014"):
-            pred_idx = 2  # Nordic Automation Systems UL2030-UL2033
-        elif eui.lower().startswith("70b3d5b02015"):
-            pred_idx = 3  # Nordic Automation Systems UL2034    
+        pred_idx = int(torch.argmax(probabilities, dim=1).item())
 
-    # Map class index to type and brand
-    label_map = {
-        0: {"type": "Telecontroller", "brand": "Ziut"},                           # Type 1
-        1: {"type": "RMC-PUK", "brand": "Remoticom"},                             # Type 2
-        2: {"type": "UL2030-UL2033", "brand": "Nordic Automation Systems"},       # Type 3
-        3: {"type": "UL2034", "brand": "Nordic Automation Systems"}               # Type 4
-    }
-    result = label_map.get(pred_idx, {"type": "Unknown", "brand": "Unknown"})
-    
-    result["EUI"] = eui
-    result["action"] = action
-    return result
+    pred_class = CLASS_NAMES[pred_idx] if 0 <= pred_idx < len(CLASS_NAMES) else str(pred_idx)
+    confidence = float(probabilities[0, pred_idx].item())
+
+    eui = ""
+    action = "no further action needed"
+
+    # Extract EUI using appropriate method based on predicted class
+    # if pred_class == "type0":
+    #     eui, action = "", "action: retry with a different image, no controller detected"
+    # elif pred_class == "type1":
+    #     eui, action = extract_eui_from_text(image)
+    #     action = "action: verify OCR accuracy or improve image quality"
+    #     if len(eui) == 8 and eui.startswith("1441"):
+    #         action = "No action needed"
+    #     else:
+    #         eui = ""
+    # elif pred_class in {"type2", "type3", "type4"}:
+    #     eui, action = extract_eui_from_qr(image)
+    #     if eui:
+    #         eui_lower = eui.lower()
+    #         override_class = None
+    #         if eui_lower.startswith("70b3d5b02013") or eui_lower.startswith("70b3d5b02014"):
+    #             override_class = "type3"  # Nordic Automation Systems UL2030-UL2033
+    #         elif eui_lower.startswith("70b3d5b02015"):
+    #             override_class = "type4"  # Nordic Automation Systems UL2034
+    #         if override_class and override_class in CLASS_NAMES:
+    #             pred_class = override_class
+    #             pred_idx = CLASS_NAMES.index(pred_class)
+    #             confidence = float(probabilities[0, pred_idx].item())
+    # else:
+    #     eui, action = "", "action: manual verification required"
+
+    details = LABEL_DETAILS.get(pred_class, {"type": "Unknown", "brand": "Unknown"}).copy()
+    details["class_name"] = pred_class
+    details["EUI"] = eui
+    details["action"] = action
+    details["confidence"] = round(confidence, 4)
+    return details
 
 # 5. Set up FastAPI app
 app = FastAPI()
@@ -285,6 +325,8 @@ app = FastAPI()
 # Define an endpoint for predictions
 @app.post("/predict/")
 async def predict_controller(file: UploadFile = File(...)):
+    start_time = datetime.now()
+    
     # Read image data from the uploaded file
     contents = await file.read()
     image = Image.open(io.BytesIO(contents))
@@ -294,4 +336,6 @@ async def predict_controller(file: UploadFile = File(...)):
     result = classify_and_extract(image)
     # Include the filename in the result
     result["filename"] = file.filename
+    result["processing_duration_ms"] = (int((datetime.now() - start_time).total_seconds() * 1000))
+
     return result

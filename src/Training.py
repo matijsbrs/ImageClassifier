@@ -15,6 +15,7 @@ __date__    = "2025-11-11"
 
 # 1. Import necessary libraries
 import os
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -47,6 +48,8 @@ val_transforms = transforms.Compose([
 # 4. Create datasets and data loaders
 train_dataset = datasets.ImageFolder(train_dir, transform=train_transforms)
 val_dataset   = datasets.ImageFolder(val_dir, transform=val_transforms) if os.path.exists(val_dir) else None
+class_names   = train_dataset.classes
+num_classes   = len(class_names)
 train_loader  = torch.utils.data.DataLoader(train_dataset, batch_size=4, shuffle=True)
 val_loader    = torch.utils.data.DataLoader(val_dataset, batch_size=4, shuffle=False) if val_dataset else None
 
@@ -57,7 +60,7 @@ for param in model.features.parameters():
     param.requires_grad = False
 # Replace classifier's last linear layer to match 4 classes
 num_ftrs = model.classifier[1].in_features  # number of input features to final layer
-model.classifier[1] = nn.Linear(num_ftrs, 4)
+model.classifier[1] = nn.Linear(num_ftrs, num_classes)
 
 # 6. Set up loss function and optimizer (only parameters of final layer will update)
 criterion = nn.CrossEntropyLoss()
@@ -67,7 +70,7 @@ optimizer = optim.Adam(model.parameters(), lr=1e-3)
 # 7. Training loop (with basic early stopping or fixed epochs)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
-num_epochs = 20
+num_epochs = 15
 for epoch in range(num_epochs):
     model.train()
     running_loss = 0.0
@@ -98,3 +101,7 @@ for epoch in range(num_epochs):
 
 # 8. Save the trained model (state dict)
 torch.save(model.state_dict(), "controller_model_weights.pth")
+
+# Persist class ordering for inference consistency
+with open("class_names.json", "w", encoding="utf-8") as class_file:
+    json.dump(class_names, class_file)
