@@ -1,16 +1,15 @@
 # Inference-API.py
 # This script sets up a FastAPI server to handle image uploads for inference.
-# It classifies controller device images into four types using a trained MobileNetV2 model
-# and extracts the EUI either via OCR (for Type 1) or QR code decoding (for Types 2-4).
+# It classifies controller device images into types using a trained MobileNetV2 model
+# and returns metadata defined in the training configuration.
 # 
 # Disclosure: This code is cowritten with AI Tools.
 # Author: Matijs Behrens
 # Date: 11-11-2025
-# Version: 1.0
+# Version: 1.1
 
 # Please ensure you have the required libraries installed:
-# pip install fastapi uvicorn torch torchvision pillow pyzbar pytesseract python-multipart opencv-python numpy
-# sudo apt install python3-pyzbar zbar-tools python3-zbar
+# pip install fastapi uvicorn torch torchvision pillow python-multipart
 
 # Run the API with:
 # .venv/bin/uvicorn src.Inference-API:app --reload --host 0.0.0.0 --port 8000
@@ -21,31 +20,14 @@ __date__    = "2025-11-11"
 
 # 1. Import libraries for inference and API
 from datetime import datetime
-import io, re, json
+import io, json
 from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import HTMLResponse
 from PIL import Image
-import numpy as np
 import torch
 from torchvision import models, transforms
-from pyzbar.pyzbar import decode  # for QR code decoding
-import pytesseract                 # for OCR
 import os
-import cv2
 from pathlib import Path
-
-
-# Redirect stderr to suppress C library warnings from pyzbar
-class SuppressStderr:
-    def __enter__(self):
-        self.null_fd = os.open(os.devnull, os.O_RDWR)
-        self.save_fd = os.dup(2)
-        os.dup2(self.null_fd, 2)
-        return self
-    
-    def __exit__(self, *_):
-        os.dup2(self.save_fd, 2)
-        os.close(self.null_fd)
-        os.close(self.save_fd)
 
 
 # 2. Load the trained model weights (ensure model architecture matches training)
@@ -72,13 +54,14 @@ num_model_classes = model.classifier[1].out_features
 if not CLASS_NAMES or len(CLASS_NAMES) != num_model_classes:
     CLASS_NAMES = [f"type{i}" for i in range(num_model_classes)]
 
-LABEL_DETAILS = {
-    "type0": {"type": "Unknown", "brand": "Unknown"},
-    "type1": {"type": "Telecontroller", "brand": "Ziut"},
-    "type2": {"type": "RMC-PUK", "brand": "Remoticom"},
-    "type3": {"type": "UL2030-UL2033", "brand": "Nordic Automation Systems"},
-    "type4": {"type": "UL2034", "brand": "Nordic Automation Systems"}
-}
+# Load class metadata (generated during training)
+CLASS_INFO_PATH = Path("class_info.json")
+try:
+    with CLASS_INFO_PATH.open("r", encoding="utf-8") as info_file:
+        CLASS_INFO = json.load(info_file)
+except FileNotFoundError:
+    print("Warning: class_info.json not found. Using empty metadata.")
+    CLASS_INFO = {}
 
 # Define the same normalization transform as used in training for inference
 infer_transform = transforms.Compose([
@@ -88,185 +71,8 @@ infer_transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-# 3. Utility functions for EUI extraction
-def extract_eui_from_text(image: Image.Image) -> str:
-    """Extract hex string EUI from an image via OCR (Type 1 devices)."""
-    # Convert image to grayscale for better OCR and apply OCR with whitelist for hex characters
-    gray = image.convert("L")
-    # Configure tesseract to only recognize 0-9 and A-F characters to improve accuracy
-    config = "--psm 6 -c tessedit_char_whitelist=0123456789ABCDEF"
-    text = pytesseract.image_to_string(gray, config=config)
-    # Use regex to find a hex string in the OCR result
-    match = re.search(r'[0-9A-F]+', text.upper())
-    return ((match.group(0), "No action needed" )if match else ("", "action: verify OCR accuracy or improve image quality"))  # return the found hex string (or empty if not found)
 
-def extract_eui_from_qr_original(image: Image.Image) -> str:
-    """Extract EUI from a QR code in the image (Types 2-4 devices)."""
-    # Convert PIL image to NumPy array for pyzbar
-    img_array = np.array(image.convert("RGB"))
-    results = decode(img_array)
-    if results:
-        # Assume first decoded QR contains the EUI
-        qr_data = results[0].data.decode("utf-8")
-        return qr_data.strip()
-    else:
-        return ""  # no QR code found or decoding failed
-    
-def extract_eui_from_qr(image: Image.Image):
-    try:
-        # resize image if too large
-        max_dimension = 5000
-        if max(image.size) > max_dimension:
-            print(f"Large image -> Resizing image from {image.size}... to fit within {max_dimension} px")
-            ratio = max_dimension / max(image.size)
-            new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
-            image = image.resize(new_size, Image.LANCZOS)
 
-        # Convert PIL Image to OpenCV format for QR/Barcode detection
-        image_np = np.array(image)
-        # Convert RGB to BGR for OpenCV
-        if len(image_np.shape) == 3 and image_np.shape[2] == 3:
-            image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-        else:
-            image_cv = image_np
-        
-        # Strategy 1: Try direct detection on original image
-        with SuppressStderr():
-            decoded_objects = decode(image_cv)
-        if decoded_objects:
-            detected_text = decoded_objects[0].data.decode('utf-8')
-            print(f"[QR/Barcode] Detected (original): '{detected_text}'")
-            return detected_text, "no further action needed"
-        
-        # Convert to grayscale for all subsequent operations
-        gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY) if len(image_cv.shape) == 3 else image_cv
-        
-        # Strategy 2: Try INVERTED image (for white QR codes on black background)
-        print("[QR] Original failed, trying inverted image...")
-        inverted = cv2.bitwise_not(gray)
-        with SuppressStderr():
-            decoded_objects = decode(inverted)
-        if decoded_objects:
-            detected_text = decoded_objects[0].data.decode('utf-8')
-            print(f"[QR/Barcode] Detected (inverted): '{detected_text}'")
-            return detected_text, "no further action needed"
-        
-        # Strategy 3: Otsu's thresholding (auto-determines optimal threshold)
-        print("[QR] Inverted failed, trying Otsu's threshold...")
-        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        with SuppressStderr():
-            decoded_objects = decode(otsu)
-        if decoded_objects:
-            detected_text = decoded_objects[0].data.decode('utf-8')
-            print(f"[QR/Barcode] Detected (Otsu): '{detected_text}'")
-            return detected_text, "no further action needed"
-        
-        # # Strategy 4: Otsu's threshold INVERTED
-        # print("[QR] Otsu failed, trying inverted Otsu...")
-        # otsu_inv = cv2.bitwise_not(otsu)
-        # with SuppressStderr():
-        #     decoded_objects = decode(otsu_inv)
-        # if decoded_objects:
-        #     detected_text = decoded_objects[0].data.decode('utf-8')
-        #     print(f"[QR/Barcode] Detected (Otsu inverted): '{detected_text}'")
-        #     return detected_text, "no further action needed"
-        
-        # # Strategy 5: Morphological operations to clean up noise
-        # print("[QR] Otsu inverted failed, trying morphological cleanup...")
-        # kernel = np.ones((3,3), np.uint8)
-        # morph = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernel)
-        # with SuppressStderr():
-        #     decoded_objects = decode(morph)
-        # if decoded_objects:
-        #     detected_text = decoded_objects[0].data.decode('utf-8')
-        #     print(f"[QR/Barcode] Detected (morphological): '{detected_text}'")
-        #     return detected_text, "no further action needed"
-        
-        # # Strategy 6: Enhance contrast with CLAHE then invert
-        # print("[QR] Morphological failed, trying CLAHE + invert...")
-        # clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        # enhanced = clahe.apply(gray)
-        # enhanced_inv = cv2.bitwise_not(enhanced)
-        # with SuppressStderr():
-        #     decoded_objects = decode(enhanced_inv)
-        # if decoded_objects:
-        #     detected_text = decoded_objects[0].data.decode('utf-8')
-        #     print(f"[QR/Barcode] Detected (CLAHE inverted): '{detected_text}'")
-        #     return detected_text, "no further action needed"
-        
-        # # Strategy 7: Sharpen + threshold
-        # print("[QR] CLAHE failed, trying sharpen + threshold...")
-        # kernel_sharpen = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        # sharpened = cv2.filter2D(gray, -1, kernel_sharpen)
-        # _, sharp_thresh = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # with SuppressStderr():
-        #     decoded_objects = decode(sharp_thresh)
-        # if decoded_objects:
-        #     detected_text = decoded_objects[0].data.decode('utf-8')
-        #     print(f"[QR/Barcode] Detected (sharpened): '{detected_text}'")
-        #     return detected_text, "no further action needed"
-        
-        # # Strategy 8: Sharpen + threshold INVERTED
-        # sharp_thresh_inv = cv2.bitwise_not(sharp_thresh)
-        # with SuppressStderr():
-        #     decoded_objects = decode(sharp_thresh_inv)
-        # if decoded_objects:
-        #     detected_text = decoded_objects[0].data.decode('utf-8')
-        #     print(f"[QR/Barcode] Detected (sharpened inverted): '{detected_text}'")
-        #     return detected_text, "no further action needed"
-        
-        # # Strategy 9: Adaptive thresholding (both regular and inverted)
-        # print("[QR] Sharpened failed, trying adaptive threshold...")
-        # for block_size in [11, 15, 21, 31]:
-        #     adaptive_thresh = cv2.adaptiveThreshold(
-        #         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block_size, 2
-        #     )
-        #     with SuppressStderr():
-        #         decoded_objects = decode(adaptive_thresh)
-        #     if decoded_objects:
-        #         detected_text = decoded_objects[0].data.decode('utf-8')
-        #         print(f"[QR/Barcode] Detected (adaptive {block_size}): '{detected_text}'")
-        #         return detected_text, "no further action needed"
-
-            
-        #     # Try inverted too
-        #     adaptive_inv = cv2.bitwise_not(adaptive_thresh)
-        #     with SuppressStderr():
-        #         decoded_objects = decode(adaptive_inv)
-        #     if decoded_objects:
-        #         detected_text = decoded_objects[0].data.decode('utf-8')
-        #         print(f"[QR/Barcode] Detected (adaptive {block_size} inverted): '{detected_text}'")
-        #         return detected_text, "no further action needed"
-
-    
-        
-        # # Strategy 10: Bilateral filter (preserves edges while reducing noise)
-        # print("[QR] Scaling failed, trying bilateral filter...")
-        # bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
-        # _, bilateral_thresh = cv2.threshold(bilateral, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # with SuppressStderr():
-        #     decoded_objects = decode(bilateral_thresh)
-        # if decoded_objects:
-        #     detected_text = decoded_objects[0].data.decode('utf-8')
-        #     print(f"[QR/Barcode] Detected (bilateral): '{detected_text}'")
-        #     return detected_text, "no further action needed"
-        
-        # bilateral_inv = cv2.bitwise_not(bilateral_thresh)
-        # with SuppressStderr():
-        #     decoded_objects = decode(bilateral_inv)
-        # if decoded_objects:
-        #     detected_text = decoded_objects[0].data.decode('utf-8')
-        #     print(f"[QR/Barcode] Detected (bilateral inverted): '{detected_text}'")
-        #     return detected_text, "no further action needed"
-        
-        # No QR code found after all strategies
-        return "Not found", "action: try better lighting, different distance, or another camera angle."
-        
-    except Exception as e:
-        print(f"[QR Scan Error] {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return f"Error: {str(e)}", "action: check server logs for details."
 
 # 4. Prediction function that uses the model to classify and then extract EUI
 def classify_and_extract(image: Image.Image):
@@ -283,44 +89,218 @@ def classify_and_extract(image: Image.Image):
     pred_class = CLASS_NAMES[pred_idx] if 0 <= pred_idx < len(CLASS_NAMES) else str(pred_idx)
     confidence = float(probabilities[0, pred_idx].item())
 
-    eui = ""
-    action = "no further action needed"
+    # Retrieve metadata for the predicted class
+    details = CLASS_INFO.get(pred_class, {}).copy()
+    
+    # If metadata is missing, provide defaults
+    if not details:
+        details = {
+            "description": "Unknown",
+            "found": "No",
+            "connection": "Unknown",
+            "brand": "Unknown",
+            "class": "Unknown",
+            "type": "Unknown"
+        }
 
-    # Extract EUI using appropriate method based on predicted class
-    # if pred_class == "type0":
-    #     eui, action = "", "action: retry with a different image, no controller detected"
-    # elif pred_class == "type1":
-    #     eui, action = extract_eui_from_text(image)
-    #     action = "action: verify OCR accuracy or improve image quality"
-    #     if len(eui) == 8 and eui.startswith("1441"):
-    #         action = "No action needed"
-    #     else:
-    #         eui = ""
-    # elif pred_class in {"type2", "type3", "type4"}:
-    #     eui, action = extract_eui_from_qr(image)
-    #     if eui:
-    #         eui_lower = eui.lower()
-    #         override_class = None
-    #         if eui_lower.startswith("70b3d5b02013") or eui_lower.startswith("70b3d5b02014"):
-    #             override_class = "type3"  # Nordic Automation Systems UL2030-UL2033
-    #         elif eui_lower.startswith("70b3d5b02015"):
-    #             override_class = "type4"  # Nordic Automation Systems UL2034
-    #         if override_class and override_class in CLASS_NAMES:
-    #             pred_class = override_class
-    #             pred_idx = CLASS_NAMES.index(pred_class)
-    #             confidence = float(probabilities[0, pred_idx].item())
-    # else:
-    #     eui, action = "", "action: manual verification required"
-
-    details = LABEL_DETAILS.get(pred_class, {"type": "Unknown", "brand": "Unknown"}).copy()
-    details["class_name"] = pred_class
-    details["EUI"] = eui
-    details["action"] = action
-    details["confidence"] = round(confidence, 4)
+    # Add confidence score
+    details["Confidence"] = f"{confidence:.0%}"
+    
     return details
 
 # 5. Set up FastAPI app
 app = FastAPI()
+
+# 6. Add a root endpoint for proof of concept
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    """Return a simple web page for testing the image classification API."""
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Image Classifier - Controller Detection</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 800px;
+                margin: 50px auto;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                background-color: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            h1 {
+                color: #333;
+                text-align: center;
+            }
+            .upload-section {
+                margin: 20px 0;
+                padding: 20px;
+                border: 2px dashed #ccc;
+                border-radius: 5px;
+                text-align: center;
+            }
+            input[type="file"] {
+                margin: 10px 0;
+            }
+            button {
+                background-color: #4CAF50;
+                color: white;
+                padding: 10px 20px;
+                border: none;
+                border-radius: 5px;
+                cursor: pointer;
+                font-size: 16px;
+            }
+            button:hover {
+                background-color: #45a049;
+            }
+            button:disabled {
+                background-color: #cccccc;
+                cursor: not-allowed;
+            }
+            #preview {
+                margin: 20px 0;
+                text-align: center;
+            }
+            #preview img {
+                max-width: 100%;
+                max-height: 400px;
+                border-radius: 5px;
+            }
+            #result {
+                margin-top: 20px;
+                padding: 15px;
+                background-color: #f9f9f9;
+                border-radius: 5px;
+                display: none;
+            }
+            .result-item {
+                margin: 8px 0;
+                padding: 8px;
+                background-color: white;
+                border-left: 4px solid #4CAF50;
+            }
+            .result-label {
+                font-weight: bold;
+                color: #666;
+            }
+            .error {
+                color: #d32f2f;
+                background-color: #ffebee;
+                border-left-color: #d32f2f;
+            }
+            .loading {
+                text-align: center;
+                color: #666;
+                display: none;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔍 Controller Image Classifier</h1>
+            <p style="text-align: center; color: #666;">Upload an image to classify controller devices</p>
+            
+            <div class="upload-section">
+                <input type="file" id="imageInput" accept="image/*" />
+                <br>
+                <button id="uploadBtn" onclick="uploadImage()">Classify Image</button>
+            </div>
+            
+            <div id="preview"></div>
+            <div class="loading" id="loading">Processing image...</div>
+            <div id="result"></div>
+        </div>
+
+        <script>
+            const imageInput = document.getElementById('imageInput');
+            const preview = document.getElementById('preview');
+            const uploadBtn = document.getElementById('uploadBtn');
+            const resultDiv = document.getElementById('result');
+            const loadingDiv = document.getElementById('loading');
+
+            imageInput.addEventListener('change', function(e) {
+                const file = e.target.files[0];
+                if (file) {
+                    const reader = new FileReader();
+                    reader.onload = function(e) {
+                        preview.innerHTML = '<img src="' + e.target.result + '" alt="Preview">';
+                    };
+                    reader.readAsDataURL(file);
+                    uploadBtn.disabled = false;
+                } else {
+                    preview.innerHTML = '';
+                    uploadBtn.disabled = true;
+                }
+                resultDiv.style.display = 'none';
+            });
+
+            async function uploadImage() {
+                const file = imageInput.files[0];
+                if (!file) {
+                    alert('Please select an image first');
+                    return;
+                }
+
+                const formData = new FormData();
+                formData.append('file', file);
+
+                uploadBtn.disabled = true;
+                loadingDiv.style.display = 'block';
+                resultDiv.style.display = 'none';
+
+                try {
+                    const response = await fetch('/predict/', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    const data = await response.json();
+                    displayResult(data);
+                } catch (error) {
+                    displayError('Error: ' + error.message);
+                } finally {
+                    uploadBtn.disabled = false;
+                    loadingDiv.style.display = 'none';
+                }
+            }
+
+            function displayResult(data) {
+                let html = '<h3>Classification Results:</h3>';
+                
+                for (const [key, value] of Object.entries(data)) {
+                    html += '<div class="result-item">';
+                    html += '<span class="result-label">' + capitalize(key) + ':</span> ';
+                    html += '<span>' + value + '</span>';
+                    html += '</div>';
+                }
+
+                resultDiv.innerHTML = html;
+                resultDiv.style.display = 'block';
+            }
+
+            function displayError(message) {
+                resultDiv.innerHTML = '<div class="result-item error">' + message + '</div>';
+                resultDiv.style.display = 'block';
+            }
+
+            function capitalize(str) {
+                return str.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+            }
+
+            // Disable button initially
+            uploadBtn.disabled = true;
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 # Define an endpoint for predictions
 @app.post("/predict/")
@@ -339,3 +319,5 @@ async def predict_controller(file: UploadFile = File(...)):
     result["processing_duration_ms"] = (int((datetime.now() - start_time).total_seconds() * 1000))
 
     return result
+
+

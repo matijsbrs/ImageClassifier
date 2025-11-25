@@ -1,0 +1,42 @@
+{
+    "type0": {
+        "description": "Random images for catching errors",
+        "found": "No",
+        "class": "N/A",
+        "connection": "N/A",
+        "brand": "N/A",
+        "type": 0
+    },
+    "type1": {
+        "description": "Telecontroller",
+        "found": "Yes",
+        "connection": "Internally wired",
+        "brand": "Ziut",
+        "class": "Controller",
+        "type": 1
+    },
+    "type2": {
+        "description": "RMC-PUK",
+        "found": "Yes",
+        "connection": "Zhaga",
+        "brand": "Remoticom",
+        "class": "Controller",
+        "type": 2
+    },
+    "type3": {
+        "description": "UL2030-UL2033",
+        "found": "Yes",
+        "connection": "Zhaga",
+        "brand": "Nordic Automation Systems",
+        "class": "Controller",
+        "type": 3
+    },
+    "type4": {
+        "description": "UL2034",
+        "found": "Yes",
+        "connection": "Zhaga",
+        "brand": "Nordic Automation Systems",
+        "class": "Controller",
+        "type": 4
+    }
+}

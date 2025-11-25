@@ -7,7 +7,7 @@
 # Version: 1.0
 
 # Please ensure you have the required libraries installed:
-# pip install torch torchvision
+# pip install torch torchvision pyyaml
 
 
 __version__ = "1.0.0"
@@ -16,6 +16,7 @@ __date__    = "2025-11-11"
 # 1. Import necessary libraries
 import os
 import json
+import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -25,6 +26,16 @@ from torchvision.models import MobileNet_V2_Weights
 # 2. Define data directories (assume images organized by class in these folders)
 train_dir = "./data/train"    # e.g., data/train/Type1, data/train/Type2, ...
 val_dir   = "./data/val"      # optional: separate validation images (if available)
+
+# Load training configuration
+config_path = os.path.join(train_dir, "train-config.yaml")
+folder_metadata = {}
+if os.path.exists(config_path):
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+        folder_metadata = config.get('TraingingData', {}).get('folders', {})
+else:
+    print(f"Warning: Config file not found at {config_path}")
 
 # 3. Define augmentation and normalization transforms
 train_transforms = transforms.Compose([
@@ -105,3 +116,22 @@ torch.save(model.state_dict(), "controller_model_weights.pth")
 # Persist class ordering for inference consistency
 with open("class_names.json", "w", encoding="utf-8") as class_file:
     json.dump(class_names, class_file)
+
+# Save class metadata for inference
+class_info = {}
+for class_name in class_names:
+    if class_name in folder_metadata:
+        class_info[class_name] = folder_metadata[class_name]
+    else:
+        class_info[class_name] = {
+            "description": "Unknown",
+            "found": "No",
+            "connection": "Unknown",
+            "brand": "Unknown",
+            "class": "Unknown",
+            "type": "Unknown"
+        }
+
+with open("class_info.json", "w", encoding="utf-8") as info_file:
+    json.dump(class_info, info_file, indent=4)
+
