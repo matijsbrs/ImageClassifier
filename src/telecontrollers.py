@@ -17,7 +17,7 @@ PROCESSED_FOLDER = "./processed"
 
 # Model configurations - models are tried in order until one succeeds
 MODELS = [
-    {
+    { # First model configuration This model is lightweight and can run on the GPU
         "name": "qwen2.5vl:3b",
         "prompt": "Spot all the text in the image with word-level and output in JSON format as [{'bbox_2d': [x1, y1, x2, y2], 'text_content': 'text'}, ...].",
         "options": {
@@ -26,7 +26,7 @@ MODELS = [
             "step_temperature": 0.5
         }
     },
-    {
+    { # Second model configuration This model is more memory intensive and cannot run on the GPU, but yields better results for the cost of speed/time
         "name": "qwen3-vl:2b-instruct",
         "prompt": "Spot all the text in the image with word-level and output in JSON format as [{'bbox_2d': [x1, y1, x2, y2], 'text_content': 'text'}, ...].",
         "options": {
@@ -35,7 +35,8 @@ MODELS = [
             "step_temperature": 0.5
         }
     },
-    {
+    { # Third model configuration This model is more memory intensive and cannot run on the GPU, It has a different internal structure than the previous two models
+      # but may yield better results for certain images.
         "name": "ministral-3:3b-instruct-2512-q4_K_M",
         "prompt": "Read the text in the image and output in full words! in JSON format as [{'text_content': 'text'}, ...].",
         "options": {
