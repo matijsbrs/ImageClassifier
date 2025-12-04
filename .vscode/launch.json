@@ -10,6 +10,13 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal"
+        },{
+            "name": "base test",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "../Preload/resized/telecontrollers.py",
+            "cwd": "${workspaceFolder}/data/retour-011225",
+            "console": "integratedTerminal"
         }
     ]
 }
