@@ -179,7 +179,7 @@ def encode_image_to_base64(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
-def detect_loop_in_response(response_text, min_pattern_length=20, min_repetitions=3):
+def detect_loop_in_response(response_text, min_pattern_length=35, min_repetitions=20):
     """
     Detect if the LLM got stuck in a loop by checking for repeated patterns.
     
@@ -300,7 +300,15 @@ def process_image_with_retry(image_path):
             
             if status == "success" and response:
                 try:
-                    return extract_json_from_response(response)  # For logging purposes
+                    hex_detections = [
+                        det for det in extract_json_from_response(response) 
+                        if is_controller_id(det.get('text_content', ''))
+                    ]
+                    if hex_detections and len(hex_detections) > 0:
+                        return hex_detections
+                    else:
+                        print(f"json extraction successful but no valid hex detections found.")
+                        continue
                 except:
                     continue # Try next attempt
                 
@@ -420,15 +428,12 @@ def process_folder(folder_path, csv_path, processed_files, existing_hex_numbers,
             # Extract JSON and filter for hexadecimal strings
             # detections = extract_json_from_response(response)
             
-            hex_detections = [
-                det for det in response 
-                if is_controller_id(det.get('text_content', ''))
-            ]
             
-            if hex_detections:
+            
+            else:
                 # Filter out already known hex numbers for display purposes
                 new_hex_detections = [
-                    det for det in hex_detections
+                    det for det in response
                     if det.get('text_content', '').strip().upper() not in existing_hex_numbers
                 ]
                 
@@ -438,7 +443,7 @@ def process_folder(folder_path, csv_path, processed_files, existing_hex_numbers,
                 total_new_entries += new_entries
                 
                 # Copy file to processed folder with first hex_text in filename
-                first_hex = hex_detections[0].get('text_content', '').strip().upper()
+                first_hex = response[0].get('text_content', '').strip().upper()
                 copy_to_processed(str(image_file), first_hex)
                 
                 # Add to processed files set
