@@ -16,10 +16,12 @@ OUTPUT_CSV = "./ocr_results.csv"
 PROCESSED_FOLDER = "./processed"
 
 # Model configurations - models are tried in order until one succeeds
+# Each model can have a custom response_processor function name to parse its output
 MODELS = [
     { # First model configuration This model is lightweight and can run on the GPU
         "name": "qwen2.5vl:3b",
         "prompt": "Spot all the text in the image with word-level and output in JSON format as [{'bbox_2d': [x1, y1, x2, y2], 'text_content': 'text'}, ...].",
+        "response_processor": "json",  # Standard JSON array response
         "options": {
             "temperature": 0.0001,
             "max_temperature": 2.1,
@@ -29,6 +31,7 @@ MODELS = [
     { # Second model configuration This model is more memory intensive and cannot run on the GPU, but yields better results for the cost of speed/time
         "name": "qwen3-vl:2b-instruct",
         "prompt": "Spot all the text in the image with word-level and output in JSON format as [{'bbox_2d': [x1, y1, x2, y2], 'text_content': 'text'}, ...].",
+        "response_processor": "json",  # Standard JSON array response
         "options": {
             "temperature": 0.0001,
             "max_temperature": 2.1,
@@ -39,13 +42,79 @@ MODELS = [
       # but may yield better results for certain images.
         "name": "ministral-3:3b-instruct-2512-q4_K_M",
         "prompt": "Read the text in the image and output in full words! in JSON format as [{'text_content': 'text'}, ...].",
+        "response_processor": "json",  # Standard JSON array response
         "options": {
             "temperature": 0.0001,
             "max_temperature": 1.51,
             "step_temperature": 0.5
         }
+    },
+    { # DeepSeek OCR model - returns plain text/markdown, not JSON
+        "name": "deepseek-ocr:3b",
+        "prompt": "<'image'>\n<|grounding|>Convert the document to markdown",
+        "response_processor": "plaintext",  # Plain text response, extract hex patterns
+        "options": {
+            "temperature": 0.0001,
+            "max_temperature": 0.1,
+            "step_temperature": 1
+        }
     }
 ]
+
+
+def process_json_response(response_text):
+    """
+    Process JSON array response from models like qwen2.5vl and qwen3-vl.
+    Returns list of detections with 'text_content' and optionally 'bbox_2d'.
+    """
+    try:
+        # Try to find JSON array in the response
+        start = response_text.find('[')
+        end = response_text.rfind(']') + 1
+        if start != -1 and end > start:
+            json_str = response_text[start:end]
+            # Remove trailing commas before ] or } (invalid JSON but common in LLM output)
+            json_str = re.sub(r',\s*]', ']', json_str)
+            json_str = re.sub(r',\s*}', '}', json_str)
+            json_str = re.sub(r'\'', '\"', json_str)
+            print(f"Extracted JSON: {json_str}")
+            return json.loads(json_str)
+    except Exception as e:
+        print(f"Error parsing JSON: {e}")
+        print(f"Failed on: Response text was: {response_text}")
+    return None
+
+
+def process_plaintext_response(response_text):
+    """
+    Process plain text/markdown response from models like deepseek-ocr.
+    Extracts all potential hex controller IDs from the text.
+    Returns list of detections with 'text_content' (no bbox available).
+    """
+    if not response_text:
+        return None
+    
+    print(f"Processing plaintext response: {response_text[:200]}...")
+    
+    # Find all 8-character hexadecimal strings in the text
+    hex_pattern = r'\b[0-9A-Fa-f]{8}\b'
+    matches = re.findall(hex_pattern, response_text)
+    
+    if matches:
+        # Convert to detection format (without bbox since plaintext doesn't provide coordinates)
+        detections = [{'text_content': match, 'bbox_2d': []} for match in matches]
+        print(f"Found {len(detections)} hex patterns in plaintext: {[d['text_content'] for d in detections]}")
+        return detections
+    
+    print("No hex patterns found in plaintext response")
+    return None
+
+
+# Map processor names to functions
+RESPONSE_PROCESSORS = {
+    "json": process_json_response,
+    "plaintext": process_plaintext_response
+}
 
 
 def load_existing_csv(csv_path):
@@ -283,12 +352,14 @@ def process_image_with_retry(image_path):
     for model_index, model_config in enumerate(MODELS):
         model_name = model_config["name"]
         options = model_config["options"]
+        processor_name = model_config.get("response_processor", "json")
+        response_processor = RESPONSE_PROCESSORS.get(processor_name, process_json_response)
         
         start_temp = options.get("temperature", 0.0001)
         max_temp = options.get("max_temperature", 1.5)
         step = options.get("step_temperature", 0.25)
         
-        print(f"   [{model_index + 1}/{len(MODELS)}] Trying model: {model_name}")
+        print(f"   [{model_index + 1}/{len(MODELS)}] Trying model: {model_name} (processor: {processor_name})")
         
         temperature = start_temp
         attempt = 1
@@ -300,18 +371,30 @@ def process_image_with_retry(image_path):
             
             if status == "success" and response:
                 try:
+                    # Use the model-specific response processor
+                    detections = response_processor(response)
+                    if detections is None:
+                        print(f"      Response processor returned None, retrying...")
+                        temperature += step
+                        attempt += 1
+                        continue
+                    
                     hex_detections = [
-                        det for det in extract_json_from_response(response) 
+                        det for det in detections 
                         if is_controller_id(det.get('text_content', ''))
                     ]
                     if hex_detections and len(hex_detections) > 0:
                         return hex_detections
                     else:
-                        print(f"json extraction successful but no valid hex detections found.")
+                        print(f"      Extraction successful but no valid hex detections found.")
+                        temperature += step
+                        attempt += 1
                         continue
-                except:
-                    continue # Try next attempt
-                
+                except Exception as e:
+                    print(f"      Error processing response: {e}")
+                    temperature += step
+                    attempt += 1
+                    continue
             
             temperature += step
             attempt += 1
@@ -330,25 +413,6 @@ def process_image_with_retry(image_path):
             print(f"   Trying next model...")
     
     print(f"   ❌ All {len(MODELS)} models failed for {image_path}")
-    return None
-
-def extract_json_from_response(response_text):
-    """Extract JSON array from response text"""
-    try:
-        # Try to find JSON array in the response
-        start = response_text.find('[')
-        end = response_text.rfind(']') + 1
-        if start != -1 and end > start:
-            json_str = response_text[start:end]
-            # Remove trailing commas before ] or } (invalid JSON but common in LLM output)
-            json_str = re.sub(r',\s*]', ']', json_str)
-            json_str = re.sub(r',\s*}', '}', json_str)
-            json_str = re.sub(r'\'', '\"', json_str)
-            print(f"Extracted JSON: {json_str}")
-            return json.loads(json_str)
-    except Exception as e:
-        print(f"Error parsing JSON: {e}")
-        print(f"Failed on: Response text was: {response_text}")
     return None
 
 def is_controller_id(text):
